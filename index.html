@@ -281,7 +281,12 @@
 <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
 <script>
 // ===== 配置 =====
-const WORKER_URL = 'https://calculations-viewer.502487460.workers.dev';
+// 按需加载代理地址：探测到第一个可用的胜出（workers.dev 被墙时由自定义域名接管）。
+// 绑好自定义域名后把新地址加在数组最前面即可，如 'https://gh-proxy.example.com'
+const WORKER_URLS = [
+  'https://calculations-viewer.502487460.workers.dev',
+];
+let WORKER_URL = WORKER_URLS[0] || '';   // 实际生效地址，probeRemote 探测后确定
 const MAX_CACHE = 3;          // 内存里最多保留几个「已解压」的包（LRU）
 const TILE_MIN = 180;         // 缩略图最小宽度（与旧版网格一致）
 const GAP = 14;               // 瓦片间距
@@ -812,19 +817,32 @@ function fileUrl(f) {
 }
 
 async function probeRemote() {
-  if (!WORKER_URL || !INDEX || !INDEX.zips || !INDEX.zips.length) return;
+  if (!INDEX || !INDEX.zips || !INDEX.zips.length) return;
   const z = INDEX.zips.find(x => x.asset_id);
-  if (!z) return;
-  try {
-    const r = await fetch(rangeUrl(z, '0-15'));
-    if (r.status === 206) {
+  if (!z || !WORKER_URLS.length) return;
+  // 并行探测所有代理地址：先拿到合法 zip 头（206 + PK）的胜出。
+  // 每个探测 8 秒超时，被墙地址不会拖慢整体判定。
+  const probe = async (base) => {
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), 8000);
+    try {
+      const r = await fetch(`${base}/range/${INDEX.repo}/${z.asset_id}?bytes=0-15`, { signal: ac.signal });
+      if (r.status !== 206) throw new Error('HTTP ' + r.status);
       const buf = new Uint8Array(await r.arrayBuffer());
-      if (buf[0] === 0x50 && buf[1] === 0x4B) REMOTE_OK = true;   // PK = 合法 zip 头
-    }
-  } catch (e) { /* 按需读取不可用，保持整包模式 */ }
+      if (!(buf[0] === 0x50 && buf[1] === 0x4B)) throw new Error('非 zip 响应');   // PK = 合法 zip 头
+      return base;
+    } finally { clearTimeout(t); }
+  };
+  try {
+    WORKER_URL = await Promise.any(WORKER_URLS.map(probe));
+    REMOTE_OK = true;
+  } catch (e) {
+    WORKER_URL = WORKER_URLS[0];         // 全部不可达：回默认地址，走整包模式
+    REMOTE_OK = false;
+  }
   updateDlLabel();
   if (REMOTE_OK) toast('✅ 已启用按需加载：查看某张图只下载那张', false);
-  else toast('⚠ 未能连接按需加载服务，图片将整包下载（速度较慢）', true);   // workers.dev 被墙/Worker 掉线时给出可见原因
+  else toast('⚠ 按需加载服务不可达（可能被墙），图片将整包下载（速度较慢）', true);   // 可见原因，而非静默降级
 }
 
 function updateDlLabel() {
