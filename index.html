@@ -263,7 +263,7 @@
   <button class="lb-close" onclick="closeLightbox()" title="关闭 (ESC)">✕</button>
   <button class="lb-nav lb-prev" onclick="lbPrev()" title="上一张 (←)">‹</button>
   <button class="lb-nav lb-next" onclick="lbNext()" title="下一张 (→)">›</button>
-  <div class="lb-hint">← → 翻页 · ESC 关闭 · 滚轮缩放 · 拖动平移 · L/R 旋转</div>
+  <div class="lb-hint">← → 翻页 · ESC 关闭 · 滚轮缩放 · 拖动平移 · L/R 旋转 · 手机左右滑动翻页</div>
   <div class="lb-toolbar">
     <button onclick="lbZoom(-0.15)" title="缩小">−</button>
     <button onclick="lbZoom(0.15)" title="放大">+</button>
@@ -434,6 +434,13 @@ function syncZipCascade() {
   sel.value = z.zip_name;
 }
 
+// 让编号段下拉框与实际正在查看的包保持一致（编号直达等不经过下拉的入口也要同步）
+function syncDropdownTo(z) {
+  if (!INDEX.zips.some(x => x.zip_name === z.zip_name)) return;
+  document.getElementById('zip-select').value = z.zip_name;
+  syncZipCascade();
+}
+
 // ===== 月份查看（年 → 月两级联动）=====
 // 年级分组：label 无年份前缀的（高中時代 / 初期發展階段…）归入「早期」
 function populateMonths() {
@@ -500,8 +507,7 @@ async function viewMonth() {
     `${label} 需要下载 ${covering.length} 个包，合计约 ${Math.round(estMB)} MB。继续？`
   )) return;
 
-  document.getElementById('zip-select').value = covering[0].zip_name;
-  syncZipCascade();
+  syncDropdownTo(covering[0]);
   CURRENT_ZIP = covering[0];
   await loadSelection(covering, ranges, label);
 }
@@ -686,27 +692,66 @@ function parseCD(cd, z) {             // 解析中央目录 → 图片条目列�
   return out;
 }
 
+// 目录持久化：跨刷新缓存中央目录条目（约 8KB/包）。
+// 以 index.json 的精确 size 做有效性校验——包被替换过（size 变了）自动失效重取。
+const RZ_LS_KEY = 'rz_dirs_v1';
+const RZ_LS_MAX = 60;          // 最多持久化 60 个包的目录（LRU）
+
+function lsLoadDir(z) {
+  try {
+    if (!Number.isFinite(z.size)) return null;          // 无精确大小，无法校验，不读缓存
+    const raw = JSON.parse(localStorage.getItem(RZ_LS_KEY) || '{}');
+    const hit = raw[z.asset_id];
+    if (!hit || hit.size !== z.size || !Array.isArray(hit.entries)) return null;
+    return hit.entries.map(e => ({ ...e, zip: z }));    // 复活时重新挂上包引用
+  } catch (e) { return null; }
+}
+
+function lsSaveDir(z, entries) {
+  try {
+    if (!Number.isFinite(z.size)) return;
+    const raw = JSON.parse(localStorage.getItem(RZ_LS_KEY) || '{}');
+    raw[z.asset_id] = {
+      size: z.size, ts: Date.now(),
+      entries: entries.map(e => ({ name: e.name, num: e.num, off: e.off, csize: e.csize, usize: e.usize, method: e.method })),
+    };
+    const ids = Object.keys(raw);
+    if (ids.length > RZ_LS_MAX) {                        // 淘汰最久未用的
+      ids.sort((a, b) => raw[a].ts - raw[b].ts);
+      for (const id of ids.slice(0, ids.length - RZ_LS_MAX)) delete raw[id];
+    }
+    localStorage.setItem(RZ_LS_KEY, JSON.stringify(raw));
+  } catch (e) { /* 存储满/隐私模式等异常，静默放弃持久化 */ }
+}
+
 function remoteDir(z) {
   let p = RZ_DIRS.get(z.asset_id);
   if (!p) {
-    p = (async () => {
-      // 包大小优先用 index.json 里的精确字节数（不读响应头，绕开 CORS 暴露规则）；
-      // 旧索引缺该字段时按 size_mb 估算，用开放区间取尾部（多取一些也能找到 EOCD）
-      const exact = Number.isFinite(z.size);
-      const est = exact ? z.size : Math.max(1, Math.ceil((z.size_mb || 100) * 1048576));
-      const lo = Math.max(0, est - 65557 - (exact ? 0 : 131072));
-      let tail = await fetchRange(z, exact
-        ? `${lo}-${est - 1}`
-        : `${lo}-`);                                             // 开放区间，长度不敏感
-      let i = findSig(tail, [0x50, 0x4B, 0x05, 0x06]);            // EOCD
-      if (i < 0) throw new Error('zip 目录定位失败');
-      const dv = new DataView(tail.buffer, tail.byteOffset + i);
-      const total = dv.getUint16(10, true);
-      const cdSize = dv.getUint32(12, true), cdOff = dv.getUint32(16, true);
-      if (cdOff === 0xFFFFFFFF || cdSize === 0xFFFFFFFF || total === 0xFFFF) throw new Error('zip64 暂不支持');
-      const cd = await fetchRange(z, `${cdOff}-${cdOff + cdSize - 1}`);
-      return parseCD(cd, z);
-    })().catch(e => { RZ_DIRS.delete(z.asset_id); throw e; });
+    const cached = lsLoadDir(z);
+    if (cached) {
+      p = Promise.resolve(cached);                       // 持久化命中：零网络请求
+    } else {
+      p = (async () => {
+        // 包大小优先用 index.json 里的精确字节数（不读响应头，绕开 CORS 暴露规则）；
+        // 旧索引缺该字段时按 size_mb 估算，用开放区间取尾部（多取一些也能找到 EOCD）
+        const exact = Number.isFinite(z.size);
+        const est = exact ? z.size : Math.max(1, Math.ceil((z.size_mb || 100) * 1048576));
+        const lo = Math.max(0, est - 65557 - (exact ? 0 : 131072));
+        let tail = await fetchRange(z, exact
+          ? `${lo}-${est - 1}`
+          : `${lo}-`);                                             // 开放区间，长度不敏感
+        let i = findSig(tail, [0x50, 0x4B, 0x05, 0x06]);            // EOCD
+        if (i < 0) throw new Error('zip 目录定位失败');
+        const dv = new DataView(tail.buffer, tail.byteOffset + i);
+        const total = dv.getUint16(10, true);
+        const cdSize = dv.getUint32(12, true), cdOff = dv.getUint32(16, true);
+        if (cdOff === 0xFFFFFFFF || cdSize === 0xFFFFFFFF || total === 0xFFFF) throw new Error('zip64 暂不支持');
+        const cd = await fetchRange(z, `${cdOff}-${cdOff + cdSize - 1}`);
+        const out = parseCD(cd, z);
+        lsSaveDir(z, out);                                 // 异步落盘，下次刷新免取目录
+        return out;
+      })().catch(e => { RZ_DIRS.delete(z.asset_id); throw e; });
+    }
     RZ_DIRS.set(z.asset_id, p);
   }
   return p;
@@ -1116,6 +1161,7 @@ function openLightbox(idx) {
   LB_SLIDE_TOKEN++;                    // 作废所有在途的翻页回调
   if (LB_SAFETY_TIMER) { clearTimeout(LB_SAFETY_TIMER); LB_SAFETY_TIMER = null; }
   document.getElementById('lightbox').classList.add('show');
+  updateNavDisabled();                 // 立即刷新箭头状态（图片加载失败时也正确）
   const curBox = $CUR(), nxtBox = $NXT();
   nxtBox.style.display = 'none';
   nxtBox.style.transition = 'none';
@@ -1188,12 +1234,14 @@ function lbPrev() { if (LB_IDX > 0 && !LB_ANIMATING) slideTo(LB_IDX - 1); }
 function lbNext() { if (LB_IDX < LB_IMAGES.length - 1 && !LB_ANIMATING) slideTo(LB_IDX + 1); }
 
 // 同时滑出+滑入；方向由索引差决定，不依赖外部传参
+// 等待图片下载期间不锁键盘：连续翻页由 token 作废旧轮，拿到图的那轮才开演动画
 function slideTo(newIdx) {
   if (LB_ANIMATING || newIdx < 0 || newIdx >= LB_IMAGES.length) return;
-  LB_ANIMATING = true;
   if (LB_SAFETY_TIMER) { clearTimeout(LB_SAFETY_TIMER); LB_SAFETY_TIMER = null; }
 
   const token = ++LB_SLIDE_TOKEN;      // 本轮令牌：旧轮一切回调凭它作废
+  document.getElementById('lb-info').textContent =
+    'No.' + p3(LB_IMAGES[newIdx].num) + ' · 加载中…';
   const curBox = $CUR();
   const nxtBox = $NXT();
   const nxtImg = document.getElementById('lb-img2');
@@ -1207,6 +1255,7 @@ function slideTo(newIdx) {
   // 1) 无过渡地锁定初始状态（按需模式：先取到图再开演动画）
   fileUrl(LB_IMAGES[newIdx]).then(u => {
     if (token !== LB_SLIDE_TOKEN) return;          // 期间已发起更新的翻页
+    LB_ANIMATING = true;                           // 动画真正开始才锁翻页
     curBox.style.transition = 'none';
     nxtBox.style.transition = 'none';
     curBox.style.transform = 'translateX(0)';
@@ -1350,6 +1399,25 @@ document.getElementById('lb-img').addEventListener('click', (e) => {
   toggleZoom();
 });
 
+// ===== 触摸滑动翻页（移动端）=====
+let TOUCH = null;
+document.getElementById('lightbox').addEventListener('touchstart', (e) => {
+  TOUCH = (e.touches.length === 1)
+    ? { x: e.touches[0].clientX, y: e.touches[0].clientY, t: Date.now() }
+    : null;                              // 多指（捏合缩放）不处理
+}, { passive: true });
+document.getElementById('lightbox').addEventListener('touchend', (e) => {
+  if (!TOUCH) return;
+  const t = e.changedTouches[0];
+  const dx = t.clientX - TOUCH.x, dy = t.clientY - TOUCH.y;
+  const dt = Date.now() - TOUCH.t;
+  TOUCH = null;
+  // 横向快滑翻页：位移足够且明显横向，限制在 500ms 内避免与拖动平移混淆
+  if (dt < 500 && Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 2) {
+    if (dx < 0) lbNext(); else lbPrev();
+  }
+}, { passive: true });
+
 // 下载并查看：当前下拉框选中的编号段
 document.getElementById('dl-btn').addEventListener('click', async () => {
   if (!INDEX) return;
@@ -1427,7 +1495,7 @@ async function jumpToNumber() {
     if (!REMOTE_OK) return false;
     try {
       const list = await singleRemote(zip, target);
-      if (list) { renderGrid(list); openLightbox(0); }
+      if (list) { syncDropdownTo(zip); renderGrid(list); openLightbox(0); }
       return true;
     } catch (e) {
       console.warn('[按需单图定位失败]', (e && e.message) || e, '→ 回退整包');
@@ -1440,7 +1508,7 @@ async function jumpToNumber() {
     if (await showSingle(owner, val)) return;
     if (!ZIP_CACHE.has(owner.zip_name)) toast(`No.${p3(val)} 在 ${owner.label}，开始下载...`);
     const list = await loadSelection([owner], null, owner.label, false);
-    if (list) openNearest(list, val);
+    if (list) { syncDropdownTo(owner); openNearest(list, val); }
     return;
   }
 
@@ -1452,7 +1520,7 @@ async function jumpToNumber() {
   toast(`No.${p3(val)} 未收录，已跳到最近的 No.${p3(next.range[0])}`);
   if (await showSingle(next, next.range[0])) return;
   const list = await loadSelection([next], null, next.label, false);
-  if (list) openNearest(list, next.range[0]);
+  if (list) { syncDropdownTo(next); openNearest(list, next.range[0]); }
 }
 
 // 范围浏览：编号段 → 自动串联覆盖范围内的所有包 → 只列出命中的图片
@@ -1475,8 +1543,7 @@ async function browseRange() {
     `No.${p3(lo)}–${p3(hi)} 需要下载 ${covering.length} 个包，合计约 ${Math.round(estMB)} MB。继续？`
   )) return;
 
-  document.getElementById('zip-select').value = covering[0].zip_name;
-  syncZipCascade();
+  syncDropdownTo(covering[0]);
   CURRENT_ZIP = covering[0];
   await loadSelection(covering, [[lo, hi]], `范围 No.${p3(lo)}–${p3(hi)}`);
 }
