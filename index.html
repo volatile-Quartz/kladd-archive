@@ -500,7 +500,13 @@ async function viewMonth() {
 
   const covering = INDEX.zips.filter(z => z.range &&
     ranges.some(r => z.range[1] >= r[0] && z.range[0] <= r[1]));
-  if (!covering.length) return toast(`${label} 的编号段尚未收录`, true);
+  if (!covering.length) {
+    const seg = ranges.map(r => `No.${p3(r[0])}–${p3(r[1])}`).join('、');
+    const have = INDEX.range_min != null
+      ? `目前已上传 No.${p3(INDEX.range_min)}–${p3(INDEX.range_max)}`
+      : '暂无已上传的包';
+    return toast(`${label}（${seg}）尚未上传，${have}`, true);
+  }
 
   const estMB = covering.reduce((s, z) => s + (z.size_mb || 0), 0);
   if (!REMOTE_OK && estMB > 900 && !window.confirm(
@@ -818,6 +824,7 @@ async function probeRemote() {
   } catch (e) { /* 按需读取不可用，保持整包模式 */ }
   updateDlLabel();
   if (REMOTE_OK) toast('✅ 已启用按需加载：查看某张图只下载那张', false);
+  else toast('⚠ 未能连接按需加载服务，图片将整包下载（速度较慢）', true);   // workers.dev 被墙/Worker 掉线时给出可见原因
 }
 
 function updateDlLabel() {
